@@ -1,0 +1,35 @@
+name: Science Policy Daily Digest
+
+on:
+  schedule:
+    # Runs every weekday at 7:00 AM Eastern (12:00 UTC)
+    - cron: "0 12 * * 1-5"
+
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run digest
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SENDGRID_API_KEY:  ${{ secrets.SENDGRID_API_KEY }}
+          FROM_EMAIL:        ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL:          ${{ secrets.TO_EMAIL }}
+        run: python src/digest.py
