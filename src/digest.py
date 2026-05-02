@@ -8,7 +8,8 @@ import re
 import sys
 import json
 import feedparser
-import google.generativeai as genai
+import google.genai as genai
+from google.genai import types
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 from datetime import datetime, timezone
@@ -138,15 +139,7 @@ Return ONLY valid JSON, no markdown, no preamble."""
 
 def summarize_with_gemini(items: list[dict]) -> dict:
     """Send feed items to Gemini and get structured digest back."""
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",   # Free tier model
-        system_instruction=SYSTEM_PROMPT,
-        generation_config=genai.GenerationConfig(
-            temperature=0.3,             # Lower = more consistent JSON output
-            max_output_tokens=8000,
-        ),
-    )
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     # Format items for the prompt
     feed_text = ""
@@ -168,7 +161,15 @@ Analyze these items and return your structured JSON digest of the most important
 stories for a senior science policy leader."""
 
     print("  🤖 Sending to Gemini for analysis...")
-    response = model.generate_content(user_prompt)
+    response = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.3,
+            max_output_tokens=8000,
+        ),
+    )
 
     # Guard against blocked or empty responses (safety filters, quota, etc.)
     try:
