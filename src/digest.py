@@ -1,6 +1,6 @@
 """
 Science Policy Daily Digest
-Fetches RSS feeds, summarizes with Google Gemini, sends via SendGrid.
+Fetches RSS feeds, summarizes with Claude, sends via SendGrid.
 """
 
 import os
@@ -8,8 +8,7 @@ import re
 import sys
 import json
 import feedparser
-import google.genai as genai
-from google.genai import types
+import anthropic
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 from datetime import datetime, timezone
@@ -47,7 +46,7 @@ RSS_FEEDS = [
 ]
 
 MAX_ITEMS_PER_FEED = 5       # Items to pull per feed
-MAX_ITEMS_TOTAL    = 60      # Cap before sending to Gemini
+MAX_ITEMS_TOTAL    = 60      # Cap before sending to Claude
 # Top stories: 3-4 with paragraph summaries; remaining items: unlimited additional links
 
 
@@ -137,9 +136,9 @@ working URL — never omit the url field or leave it blank.
 Return ONLY valid JSON, no markdown, no preamble."""
 
 
-def summarize_with_gemini(items: list[dict]) -> dict:
-    """Send feed items to Gemini and get structured digest back."""
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+def summarize_with_claude(items: list[dict]) -> dict:
+    """Send feed items to Claude and get structured digest back."""
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
     # Format items for the prompt
     feed_text = ""
@@ -160,24 +159,15 @@ Here are today's science policy news items from across your monitored sources:
 Analyze these items and return your structured JSON digest of the most important 
 stories for a senior science policy leader."""
 
-    print("  🤖 Sending to Gemini for analysis...")
-    response = client.models.generate_content(
-        model="gemini-2.0-flash-lite",
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.3,
-            max_output_tokens=8000,
-        ),
+    print("  🤖 Sending to Claude for analysis...")
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=8000,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}]
     )
 
-    # Guard against blocked or empty responses (safety filters, quota, etc.)
-    try:
-        raw = response.text.strip()
-    except ValueError as e:
-        print(f"  ❌ Gemini returned no usable content: {e}")
-        print(f"     Finish reason: {response.candidates[0].finish_reason if response.candidates else 'unknown'}")
-        sys.exit(1)
+    raw = response.content[0].text.strip()
 
     # Strip markdown code fences robustly (handles ```json, ``` json, ``` etc.)
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
@@ -186,10 +176,10 @@ stories for a senior science policy leader."""
     try:
         digest = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"  ❌ Gemini returned invalid JSON: {e}\n  Raw output:\n{raw[:500]}")
+        print(f"  ❌ Claude returned invalid JSON: {e}\n  Raw output:\n{raw[:500]}")
         sys.exit(1)
 
-    print(f"  ✅ Gemini returned {len(digest.get('top_stories', []))} top stories + {len(digest.get('additional_links', []))} additional links")
+    print(f"  ✅ Claude returned {len(digest.get('top_stories', []))} top stories + {len(digest.get('additional_links', []))} additional links")
     return digest
 
 
@@ -451,7 +441,7 @@ def build_email_html(digest: dict) -> str:
           <td style="background:#f3f4f6;padding:16px 36px;
                      border-top:1px solid #e5e7eb;">
             <div style="font-size:11px;color:#9ca3af;line-height:1.6;">
-              Science Policy Digest · Powered by Google Gemini &amp; curated RSS feeds ·
+              Science Policy Digest · Powered by Claude &amp; curated RSS feeds ·
               To update sources or delivery time, edit
               <code>src/digest.py</code>
             </div>
@@ -501,7 +491,7 @@ def main():
     print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}\n")
 
     # Validate required environment variables up front
-    required = ["GEMINI_API_KEY", "SENDGRID_API_KEY", "FROM_EMAIL", "TO_EMAIL"]
+    required = ["ANTHROPIC_API_KEY", "SENDGRID_API_KEY", "FROM_EMAIL", "TO_EMAIL"]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
         print(f"❌ Missing required environment variables: {', '.join(missing)}")
@@ -514,8 +504,8 @@ def main():
         print("❌ No items fetched — aborting.")
         sys.exit(1)
 
-    print("\n🤖 Summarizing with Gemini...")
-    digest = summarize_with_gemini(items)
+    print("\n🤖 Summarizing with Claude...")
+    digest = summarize_with_claude(items)
 
     print("\n📧 Building and sending email...")
     html = build_email_html(digest)
