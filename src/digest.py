@@ -162,7 +162,7 @@ stories for a senior science policy leader."""
 
     print("  🤖 Sending to Gemini for analysis...")
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-2.0-flash-lite",
         contents=user_prompt,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
