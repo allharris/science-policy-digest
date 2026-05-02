@@ -1,6 +1,6 @@
 """
 Science Policy Daily Digest
-Fetches RSS feeds, summarizes with Claude, sends via SendGrid.
+Fetches RSS feeds, summarizes with Google Gemini, sends via SendGrid.
 """
 
 import os
@@ -8,7 +8,7 @@ import re
 import sys
 import json
 import feedparser
-import anthropic
+import google.generativeai as genai
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 from datetime import datetime, timezone
@@ -46,8 +46,8 @@ RSS_FEEDS = [
 ]
 
 MAX_ITEMS_PER_FEED = 5       # Items to pull per feed
-MAX_ITEMS_TOTAL    = 60      # Cap before sending to Claude
-MAX_DIGEST_ITEMS   = 8       # Stories in the final email
+MAX_ITEMS_TOTAL    = 60      # Cap before sending to Gemini
+# Top stories: 3-4 with paragraph summaries; remaining items: unlimited additional links
 
 
 # ─── Step 1: Fetch RSS Feeds ──────────────────────────────────────────────────
@@ -79,7 +79,7 @@ def fetch_feeds(feeds: list[dict]) -> list[dict]:
     return items[:MAX_ITEMS_TOTAL]
 
 
-# ─── Step 2: Summarize with Claude ────────────────────────────────────────────
+# ─── Step 2: Summarize with Gemini ───────────────────────────────────────────
 
 SYSTEM_PROMPT = f"""You are a senior science policy analyst briefing a senior leader 
 at a science policy organization. Your job is to identify the most consequential 
@@ -95,31 +95,58 @@ landscape — with particular focus on:
 - AI, quantum, and emerging technology policy
 - Agency reorganizations and structural changes
 
+ACTION FLAG CRITERIA — set action_flag to true if ANY of these apply:
+- A comment period, application deadline, or congressional hearing is within 14 days
+- A funding opportunity has been announced or is closing soon
+- An executive order or agency rule takes effect imminently
+- Congressional testimony or a markup is scheduled this week
+- An injunction, court ruling, or legal deadline requires immediate organizational response
+- A grant termination or funding freeze directly affects the research community now
+
 Your output must be a JSON object with this exact structure:
 {{
   "headline": "A single punchy 10-word headline summarizing today's most important story",
   "date": "Today's date in Month Day, Year format",
-  "stories": [
+  "one_liner": "A single sentence summarizing the overall policy environment today",
+  "top_stories": [
     {{
       "rank": 1,
-      "title": "Short story title (8 words max)",
-      "why_it_matters": "2-3 sentences explaining significance for science policy professionals",
-      "action_flag": true or false (true if requires immediate attention or action),
-      "source": "Source name",
-      "url": "URL if available"
+      "title": "Descriptive story title, no word limit",
+      "paragraph": "A full paragraph of 4-6 sentences summarizing what happened, why it matters for the science policy community, what the key stakeholders are doing, and what comes next.",
+      "action_flag": true or false,
+      "action_reason": "If action_flag is true, one sentence explaining exactly what action is needed and by when. If false, leave as empty string.",
+      "source": "Publication or agency name",
+      "url": "Full absolute URL starting with https:// — REQUIRED, do not omit"
     }}
   ],
-  "one_liner": "A single sentence summarizing the overall policy environment today"
+  "additional_links": [
+    {{
+      "title": "Story headline",
+      "one_sentence": "One sentence describing what happened and why it matters.",
+      "action_flag": true or false,
+      "source": "Publication or agency name",
+      "url": "Full absolute URL starting with https:// — REQUIRED, do not omit"
+    }}
+  ]
 }}
 
-Select the {MAX_DIGEST_ITEMS} most important and actionable stories. Prioritize 
-time-sensitive items, congressional actions, funding decisions, and executive 
-branch moves. Return ONLY valid JSON, no markdown, no preamble."""
+Select 3-4 items for top_stories. Include ALL remaining items as additional_links — 
+do not limit the number of additional links. Every single item must have a real, 
+working URL — never omit the url field or leave it blank.
+Return ONLY valid JSON, no markdown, no preamble."""
 
 
-def summarize_with_claude(items: list[dict]) -> dict:
-    """Send feed items to Claude and get structured digest back."""
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+def summarize_with_gemini(items: list[dict]) -> dict:
+    """Send feed items to Gemini and get structured digest back."""
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash",   # Free tier model
+        system_instruction=SYSTEM_PROMPT,
+        generation_config=genai.GenerationConfig(
+            temperature=0.3,             # Lower = more consistent JSON output
+            max_output_tokens=8000,
+        ),
+    )
 
     # Format items for the prompt
     feed_text = ""
@@ -140,15 +167,17 @@ Here are today's science policy news items from across your monitored sources:
 Analyze these items and return your structured JSON digest of the most important 
 stories for a senior science policy leader."""
 
-    print("  🤖 Sending to Claude for analysis...")
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}]
-    )
+    print("  🤖 Sending to Gemini for analysis...")
+    response = model.generate_content(user_prompt)
 
-    raw = response.content[0].text.strip()
+    # Guard against blocked or empty responses (safety filters, quota, etc.)
+    try:
+        raw = response.text.strip()
+    except ValueError as e:
+        print(f"  ❌ Gemini returned no usable content: {e}")
+        print(f"     Finish reason: {response.candidates[0].finish_reason if response.candidates else 'unknown'}")
+        sys.exit(1)
+
     # Strip markdown code fences robustly (handles ```json, ``` json, ``` etc.)
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
     raw = re.sub(r"\s*```$", "", raw).strip()
@@ -156,71 +185,194 @@ stories for a senior science policy leader."""
     try:
         digest = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"  ❌ Claude returned invalid JSON: {e}\n  Raw output:\n{raw[:500]}")
+        print(f"  ❌ Gemini returned invalid JSON: {e}\n  Raw output:\n{raw[:500]}")
         sys.exit(1)
-    print(f"  ✅ Claude returned {len(digest.get('stories', []))} stories")
+
+    print(f"  ✅ Gemini returned {len(digest.get('top_stories', []))} top stories + {len(digest.get('additional_links', []))} additional links")
     return digest
 
 
 # ─── Step 3: Format HTML Email ────────────────────────────────────────────────
 
+ACTION_CRITERIA_HTML = """
+<tr>
+  <td style="padding:16px 36px 20px;">
+    <div style="background:#fefce8;border:1px solid #fde68a;border-radius:6px;
+                padding:14px 18px;">
+      <div style="font-size:11px;font-weight:700;color:#92400e;
+                  text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">
+        &#9889; Action Flag Criteria
+      </div>
+      <div style="font-size:12px;color:#78350f;line-height:1.7;">
+        A story is flagged for action when one or more of the following apply:
+        a comment period, application deadline, or hearing falls within 14 days;
+        a funding opportunity has been announced or is closing soon;
+        an executive order or agency rule takes effect imminently;
+        congressional testimony or a markup is scheduled this week;
+        a court ruling or legal deadline requires immediate organizational response; or
+        a grant termination or funding freeze directly affects the research community now.
+      </div>
+    </div>
+  </td>
+</tr>"""
+
+
+def _action_badge_html(story: dict) -> str:
+    """Return action badge + reason as a block-level element (never inline)."""
+    if not story.get("action_flag"):
+        return ""
+    reason = escape(story.get("action_reason") or "")
+    badge = (
+        '<div style="margin-top:8px;">'
+        '<span style="display:inline-block;background:#b91c1c;color:#fff;'
+        'font-size:10px;font-weight:700;padding:3px 10px;border-radius:4px;'
+        'text-transform:uppercase;letter-spacing:0.06em;">&#9889; Action Needed</span>'
+    )
+    if reason:
+        badge += (
+            f'<span style="font-size:12px;color:#b91c1c;margin-left:8px;'
+            f'font-style:italic;">{reason}</span>'
+        )
+    badge += "</div>"
+    return badge
+
+
+def _story_url_html(url: str, label: str = "Read more →") -> str:
+    """Return a source link, or empty string if URL is missing/invalid."""
+    if not url or not url.startswith("http"):
+        return ""
+    return (
+        f'<a href="{escape(url)}" style="font-size:12px;color:#2563eb;'
+        f'text-decoration:none;font-weight:600;">{label}</a>'
+    )
+
+
 def build_email_html(digest: dict) -> str:
     """Render the digest as a clean HTML email."""
-
-    stories_html = ""
-    for story in digest.get("stories", []):
-        action_badge = ""
-        if story.get("action_flag"):
-            action_badge = (
-                '<span style="background:#b91c1c;color:#fff;'
-                'font-size:10px;font-weight:700;padding:2px 8px;'
-                'border-radius:999px;margin-left:8px;'
-                'text-transform:uppercase;letter-spacing:0.05em;">'
-                '⚡ Action Needed</span>'
-            )
-
-        url        = story.get("url") or ""
-        # Only use URL as a link if it looks like a real absolute URL
-        if not url.startswith("http"):
-            url = ""
-        title      = story.get("title", "Untitled")
-        source     = story.get("source", "")
-        rank       = story.get("rank", "")
-        why        = story.get("why_it_matters", "")
-        title_html = (
-            f'<a href="{escape(url)}" style="color:#1e3a5f;text-decoration:none;">'
-            f'{escape(title)}</a>'
-            if url else escape(title)
-        )
-
-        stories_html += f"""
-        <tr>
-          <td style="padding:16px 0;border-bottom:1px solid #e5e7eb;">
-            <div style="font-size:11px;color:#6b7280;text-transform:uppercase;
-                        letter-spacing:0.08em;font-weight:600;margin-bottom:4px;">
-              #{rank} · {escape(source)}
-            </div>
-            <div style="font-size:16px;font-weight:700;color:#1e3a5f;
-                        margin-bottom:6px;line-height:1.35;">
-              {title_html}{action_badge}
-            </div>
-            <div style="font-size:14px;color:#374151;line-height:1.6;">
-              {escape(why)}
-            </div>
-          </td>
-        </tr>"""
 
     one_liner = escape(digest.get("one_liner", ""))
     headline  = escape(digest.get("headline",  "Science Policy Daily Digest"))
     date_str  = escape(digest.get("date", datetime.now().strftime("%B %d, %Y")))
 
+    # ── Top Stories (paragraph summaries) ──────────────────────────────────────
+    top_stories_html = ""
+    for story in digest.get("top_stories", []):
+        url    = story.get("url") or ""
+        if not url.startswith("http"):
+            url = ""
+        title  = story.get("title") or "Untitled"
+        source = story.get("source") or ""
+        rank   = story.get("rank") or ""
+        para   = story.get("paragraph") or ""
+
+        title_linked = (
+            f'<a href="{escape(url)}" style="color:#1e3a5f;text-decoration:none;">'
+            f'{escape(title)}</a>'
+            if url else escape(title)
+        )
+
+        top_stories_html += f"""
+        <tr>
+          <td style="padding:20px 0;border-bottom:2px solid #e5e7eb;">
+            <div style="font-size:11px;color:#6b7280;text-transform:uppercase;
+                        letter-spacing:0.08em;font-weight:600;margin-bottom:6px;">
+              Top Story #{rank} · {escape(source)}
+            </div>
+            <div style="font-size:17px;font-weight:800;color:#1e3a5f;
+                        line-height:1.4;margin-bottom:10px;">
+              {title_linked}
+            </div>
+            <div style="font-size:14px;color:#374151;line-height:1.75;
+                        margin-bottom:10px;">
+              {escape(para)}
+            </div>
+            <div style="margin-bottom:10px;">
+              {_story_url_html(url)}
+            </div>
+            {_action_badge_html(story)}
+          </td>
+        </tr>"""
+
+    # ── Additional Links ────────────────────────────────────────────────────────
+    additional_html = ""
+    for link in digest.get("additional_links", []):
+        url      = link.get("url") or ""
+        if not url.startswith("http"):
+            url = ""
+        title    = link.get("title") or "Untitled"
+        one_sent = link.get("one_sentence") or ""
+        source   = link.get("source") or ""
+        is_action = link.get("action_flag", False)
+
+        action_dot = (
+            '<span style="display:inline-block;width:8px;height:8px;'
+            'background:#b91c1c;border-radius:50%;margin-right:6px;'
+            'vertical-align:middle;" title="Action needed"></span>'
+            if is_action else
+            '<span style="display:inline-block;width:8px;height:8px;'
+            'background:#d1d5db;border-radius:50%;margin-right:6px;'
+            'vertical-align:middle;"></span>'
+        )
+
+        title_linked = (
+            f'<a href="{escape(url)}" style="color:#1e40af;text-decoration:none;'
+            f'font-weight:600;font-size:13px;">{escape(title)}</a>'
+            if url else
+            f'<span style="color:#1e40af;font-weight:600;font-size:13px;">'
+            f'{escape(title)}</span>'
+        )
+
+        additional_html += f"""
+        <tr>
+          <td style="padding:10px 0;border-bottom:1px solid #f3f4f6;">
+            <table width="100%" cellpadding="0" cellspacing="0">
+              <tr>
+                <td width="16" style="vertical-align:top;padding-top:3px;">
+                  {action_dot}
+                </td>
+                <td style="vertical-align:top;">
+                  {title_linked}
+                  <span style="font-size:11px;color:#9ca3af;margin-left:6px;">
+                    {escape(source)}
+                  </span>
+                  <div style="font-size:12px;color:#6b7280;line-height:1.5;
+                              margin-top:3px;">
+                    {escape(one_sent)}
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>"""
+
+    # ── Legend for additional links ─────────────────────────────────────────────
+    legend_html = """
+    <tr>
+      <td style="padding:10px 0 4px;">
+        <span style="font-size:11px;color:#6b7280;">
+          <span style="display:inline-block;width:8px;height:8px;background:#b91c1c;
+                border-radius:50%;margin-right:4px;vertical-align:middle;"></span>
+          Action needed &nbsp;&nbsp;
+          <span style="display:inline-block;width:8px;height:8px;background:#d1d5db;
+                border-radius:50%;margin-right:4px;vertical-align:middle;"></span>
+          For awareness
+        </span>
+      </td>
+    </tr>"""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Helvetica Neue',Arial,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:32px 0;">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Science Policy Digest</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f4f6;
+             font-family:'Helvetica Neue',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0"
+         style="background:#f3f4f6;padding:32px 0;">
     <tr><td align="center">
-      <table width="620" cellpadding="0" cellspacing="0"
+      <table width="640" cellpadding="0" cellspacing="0"
              style="background:#fff;border-radius:8px;overflow:hidden;
                     box-shadow:0 1px 4px rgba(0,0,0,0.08);">
 
@@ -239,30 +391,68 @@ def build_email_html(digest: dict) -> str:
 
         <!-- One-liner -->
         <tr>
-          <td style="background:#eff6ff;padding:14px 36px;border-bottom:1px solid #dbeafe;">
-            <div style="font-size:13px;color:#1e40af;line-height:1.5;font-style:italic;">
+          <td style="background:#eff6ff;padding:14px 36px;
+                     border-bottom:1px solid #dbeafe;">
+            <div style="font-size:13px;color:#1e40af;line-height:1.5;
+                        font-style:italic;">
               {one_liner}
             </div>
           </td>
         </tr>
 
-        <!-- Stories -->
+        <!-- Action Criteria Box -->
+        {ACTION_CRITERIA_HTML}
+
+        <!-- Top Stories header -->
         <tr>
-          <td style="padding:4px 36px 8px;">
+          <td style="padding:4px 36px 0;">
+            <div style="font-size:13px;font-weight:700;color:#1e3a5f;
+                        text-transform:uppercase;letter-spacing:0.1em;
+                        border-bottom:3px solid #1e3a5f;padding-bottom:6px;">
+              Top Stories
+            </div>
+          </td>
+        </tr>
+
+        <!-- Top Stories -->
+        <tr>
+          <td style="padding:0 36px 8px;">
             <table width="100%" cellpadding="0" cellspacing="0">
-              {stories_html}
+              {top_stories_html}
+            </table>
+          </td>
+        </tr>
+
+        <!-- Additional Links header -->
+        <tr>
+          <td style="padding:20px 36px 0;background:#f9fafb;
+                     border-top:2px solid #e5e7eb;">
+            <div style="font-size:13px;font-weight:700;color:#374151;
+                        text-transform:uppercase;letter-spacing:0.1em;
+                        border-bottom:2px solid #d1d5db;padding-bottom:6px;">
+              Additional Links
+            </div>
+          </td>
+        </tr>
+
+        <!-- Additional Links -->
+        <tr>
+          <td style="padding:0 36px 16px;background:#f9fafb;">
+            <table width="100%" cellpadding="0" cellspacing="0">
+              {legend_html}
+              {additional_html}
             </table>
           </td>
         </tr>
 
         <!-- Footer -->
         <tr>
-          <td style="background:#f9fafb;padding:20px 36px;
+          <td style="background:#f3f4f6;padding:16px 36px;
                      border-top:1px solid #e5e7eb;">
             <div style="font-size:11px;color:#9ca3af;line-height:1.6;">
-              Generated daily by your Science Policy Digest · 
-              Powered by Claude &amp; curated RSS feeds ·
-              To update sources or frequency, edit <code>src/digest.py</code>
+              Science Policy Digest · Powered by Google Gemini &amp; curated RSS feeds ·
+              To update sources or delivery time, edit
+              <code>src/digest.py</code>
             </div>
           </td>
         </tr>
@@ -280,8 +470,11 @@ def send_email(html: str, digest: dict):
     """Send the formatted digest via SendGrid."""
     sg = SendGridAPIClient(api_key=os.environ["SENDGRID_API_KEY"])
 
+    raw_headline = digest.get('headline', 'Daily Digest')
+    if len(raw_headline) > 80:
+        raw_headline = raw_headline[:77] + "..."
     subject = (
-        f"[Science Policy] {digest.get('headline', 'Daily Digest')} · "
+        f"[Science Policy] {raw_headline} · "
         f"{datetime.now().strftime('%b %d')}"
     )
 
@@ -307,7 +500,7 @@ def main():
     print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}\n")
 
     # Validate required environment variables up front
-    required = ["ANTHROPIC_API_KEY", "SENDGRID_API_KEY", "FROM_EMAIL", "TO_EMAIL"]
+    required = ["GEMINI_API_KEY", "SENDGRID_API_KEY", "FROM_EMAIL", "TO_EMAIL"]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
         print(f"❌ Missing required environment variables: {', '.join(missing)}")
@@ -320,8 +513,8 @@ def main():
         print("❌ No items fetched — aborting.")
         sys.exit(1)
 
-    print("\n🤖 Summarizing with Claude...")
-    digest = summarize_with_claude(items)
+    print("\n🤖 Summarizing with Gemini...")
+    digest = summarize_with_gemini(items)
 
     print("\n📧 Building and sending email...")
     html = build_email_html(digest)
