@@ -79,7 +79,7 @@ def fetch_feeds(feeds: list[dict]) -> list[dict]:
     return items[:MAX_ITEMS_TOTAL]
 
 
-# ─── Step 2: Summarize with Gemini ───────────────────────────────────────────
+# ─── Step 2: Summarize with Claude ──────────────────────────────────────────
 
 SYSTEM_PROMPT = f"""You are a senior science policy analyst briefing a senior leader 
 at a science policy organization. Your job is to identify the most consequential 
@@ -112,7 +112,7 @@ Your output must be a JSON object with this exact structure:
     {{
       "rank": 1,
       "title": "Descriptive story title, no word limit",
-      "paragraph": "A full paragraph of 4-6 sentences summarizing what happened, why it matters for the science policy community, what the key stakeholders are doing, and what comes next.",
+      "paragraph": "A tight ~100-word summary written for easy skimming. Use plain, direct sentences. Cover: what happened, why it matters, and what comes next. No jargon. No long wind-ups. Get to the point immediately.",
       "action_flag": true or false,
       "action_reason": "If action_flag is true, one sentence explaining exactly what action is needed and by when. If false, leave as empty string.",
       "source": "Publication or agency name",
@@ -179,7 +179,7 @@ stories for a senior science policy leader."""
         print(f"  ❌ Claude returned invalid JSON: {e}\n  Raw output:\n{raw[:500]}")
         sys.exit(1)
 
-    print(f"  ✅ Claude returned {len(digest.get('top_stories', []))} top stories + {len(digest.get('additional_links', []))} additional links")
+    print(f"  ✅ Claude returned {len(digest.get('top_stories') or [])} top stories + {len(digest.get('additional_links') or [])} additional links")
     return digest
 
 
@@ -187,7 +187,7 @@ stories for a senior science policy leader."""
 
 ACTION_CRITERIA_HTML = """
 <tr>
-  <td style="padding:16px 36px 20px;">
+  <td style="padding:16px 36px 20px;background:#f9fafb;border-top:1px solid #e5e7eb;">
     <div style="background:#fefce8;border:1px solid #fde68a;border-radius:6px;
                 padding:14px 18px;">
       <div style="font-size:11px;font-weight:700;color:#92400e;
@@ -228,32 +228,32 @@ def _action_badge_html(story: dict) -> str:
     return badge
 
 
-def _story_url_html(url: str, label: str = "Read more →") -> str:
+def _story_url_html(url: str, label: str = "Read more &#8594;") -> str:
     """Return a source link, or empty string if URL is missing/invalid."""
     if not url or not url.startswith("http"):
         return ""
     return (
         f'<a href="{escape(url)}" style="font-size:12px;color:#2563eb;'
-        f'text-decoration:none;font-weight:600;">{label}</a>'
+        f'text-decoration:none;font-weight:600;">{escape(label)}</a>'
     )
 
 
 def build_email_html(digest: dict) -> str:
     """Render the digest as a clean HTML email."""
 
-    one_liner = escape(digest.get("one_liner", ""))
-    headline  = escape(digest.get("headline",  "Science Policy Daily Digest"))
-    date_str  = escape(digest.get("date", datetime.now().strftime("%B %d, %Y")))
+    one_liner = escape(digest.get("one_liner") or "")
+    headline  = escape(digest.get("headline")  or "Science Policy Daily Digest")
+    date_str  = escape(digest.get("date")      or datetime.now().strftime("%B %d, %Y"))
 
     # ── Top Stories (paragraph summaries) ──────────────────────────────────────
     top_stories_html = ""
-    for story in digest.get("top_stories", []):
+    for story in (digest.get("top_stories") or []):
         url    = story.get("url") or ""
         if not url.startswith("http"):
             url = ""
         title  = story.get("title") or "Untitled"
         source = story.get("source") or ""
-        rank   = story.get("rank") or ""
+        rank   = str(story.get("rank") or "")
         para   = story.get("paragraph") or ""
 
         title_linked = (
@@ -286,14 +286,14 @@ def build_email_html(digest: dict) -> str:
 
     # ── Additional Links ────────────────────────────────────────────────────────
     additional_html = ""
-    for link in digest.get("additional_links", []):
+    for link in (digest.get("additional_links") or []):
         url      = link.get("url") or ""
         if not url.startswith("http"):
             url = ""
         title    = link.get("title") or "Untitled"
         one_sent = link.get("one_sentence") or ""
         source   = link.get("source") or ""
-        is_action = link.get("action_flag", False)
+        is_action = bool(link.get("action_flag"))
 
         action_dot = (
             '<span style="display:inline-block;width:8px;height:8px;'
@@ -391,9 +391,6 @@ def build_email_html(digest: dict) -> str:
           </td>
         </tr>
 
-        <!-- Action Criteria Box -->
-        {ACTION_CRITERIA_HTML}
-
         <!-- Top Stories header -->
         <tr>
           <td style="padding:4px 36px 0;">
@@ -415,26 +412,10 @@ def build_email_html(digest: dict) -> str:
         </tr>
 
         <!-- Additional Links header -->
-        <tr>
-          <td style="padding:20px 36px 0;background:#f9fafb;
-                     border-top:2px solid #e5e7eb;">
-            <div style="font-size:13px;font-weight:700;color:#374151;
-                        text-transform:uppercase;letter-spacing:0.1em;
-                        border-bottom:2px solid #d1d5db;padding-bottom:6px;">
-              Additional Links
-            </div>
-          </td>
-        </tr>
+        {'<tr><td style="padding:20px 36px 0;background:#f9fafb;border-top:2px solid #e5e7eb;"><div style="font-size:13px;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:0.1em;border-bottom:2px solid #d1d5db;padding-bottom:6px;">Additional Links</div></td></tr><tr><td style="padding:0 36px 16px;background:#f9fafb;"><table width="100%" cellpadding="0" cellspacing="0">' + legend_html + additional_html + '</table></td></tr>' if additional_html.strip() else ''}
 
-        <!-- Additional Links -->
-        <tr>
-          <td style="padding:0 36px 16px;background:#f9fafb;">
-            <table width="100%" cellpadding="0" cellspacing="0">
-              {legend_html}
-              {additional_html}
-            </table>
-          </td>
-        </tr>
+        <!-- Action Flag Criteria -->
+        {ACTION_CRITERIA_HTML}
 
         <!-- Footer -->
         <tr>
@@ -461,7 +442,7 @@ def send_email(html: str, digest: dict):
     """Send the formatted digest via SendGrid."""
     sg = SendGridAPIClient(api_key=os.environ["SENDGRID_API_KEY"])
 
-    raw_headline = digest.get('headline', 'Daily Digest')
+    raw_headline = digest.get('headline') or 'Daily Digest'
     if len(raw_headline) > 80:
         raw_headline = raw_headline[:77] + "..."
     subject = (
